@@ -1,0 +1,22 @@
+{
+  "mcp_command": {
+    "description": "MCP 启动命令",
+    "type": "string",
+    "default": "python",
+    "hint": "用于启动 mucage_mcp.py 的 Python 解释器。通常填写 python；若 AstrBot 运行环境中找不到该命令，请填写 Python 解释器的绝对路径。"
+  },
+  "mcp_script_path": {
+    "description": "mucage_mcp.py 路径",
+    "type": "string",
+    "default": "",
+    "obvious_hint": true,
+    "hint": "账本软件附带的 MCP stdio 包装器 mucage_mcp.py 的完整路径。本插件不内置该文件，请按你的实际安装位置填写；Windows 路径可直接使用反斜杠。"
+  },
+  "allowed_sessions": {
+    "description": "允许使用指令的会话",
+    "type": "list",
+    "default": [],
+    "_special": "umo",
+    "hint": "仅列表中的会话可以触发记账指令。可在此选择会话，或在目标会话发送 /sid 获取 UMO 后手动添加。留空表示所有会话均不可使用。"
+  }
+}
