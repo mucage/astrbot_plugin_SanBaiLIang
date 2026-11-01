@@ -1,4 +1,4 @@
-# astrbot_plugin_mucage
+# astrbot_plugin_SanBaiLIang
 
 为 AstrBot 提供固定指令，读写本机「此地无银三百两」账本。
 
@@ -36,9 +36,9 @@
 
 ## 安装
 
-1. 将整个 `astrbot_plugin_mucage` 目录放入 AstrBot 的 `data/plugins/`：
-   - 源码部署：`AstrBot/data/plugins/astrbot_plugin_mucage`
-   - AstrBot Desktop：`%USERPROFILE%\.astrbot\data\plugins\astrbot_plugin_mucage`
+1. 将整个 `astrbot_plugin_SanBaiLIang` 目录放入 AstrBot 的 `data/plugins/`：
+   - 源码部署：`AstrBot/data/plugins/astrbot_plugin_SanBaiLIang`
+   - AstrBot Desktop：`%USERPROFILE%\.astrbot\data\plugins\astrbot_plugin_SanBaiLIang`
 2. 安装依赖。AstrBot 通常会自动读取 `requirements.txt`；也可以在 AstrBot 使用的 Python 环境中执行：
 
    ```powershell
@@ -163,7 +163,7 @@ New-Item -ItemType Directory -Force $env:MUCAGE_LEDGER_HOME | Out-Null
 
 1. 在 WebUI 停用插件（会触发 `terminate` 并关闭 MCP 子进程）。
 2. 删除插件目录。
-3. 如需彻底清理，删除插件配置 `data/config/astrbot_plugin_mucage_config.json`。
+3. 如需彻底清理，删除插件配置 `data/config/astrbot_plugin_SanBaiLIang_config.json`。
 
 ## 参考
 

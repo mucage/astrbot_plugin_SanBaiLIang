@@ -16,7 +16,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
-PLUGIN_NAME = "astrbot_plugin_mucage"
+PLUGIN_NAME = "astrbot_plugin_SanBaiLIang"
 PLUGIN_VERSION = "1.0.0"
 
 STARTUP_TIMEOUT = 20
