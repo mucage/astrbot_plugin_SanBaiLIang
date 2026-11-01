@@ -1,11 +1,18 @@
+# Copyright (C) 2026 mucage
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from __future__ import annotations
 
 import asyncio
 import json
 import math
 import os
+import shutil
+import time
+import uuid
 from contextlib import AsyncExitStack
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
@@ -14,7 +21,9 @@ from mcp.types import CallToolResult, TextContent
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.message_components import File
+from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.api.util import SessionController, session_waiter
 
 PLUGIN_NAME = "astrbot_plugin_SanBaiLIang"
 PLUGIN_VERSION = "1.0.0"
@@ -22,6 +31,12 @@ PLUGIN_VERSION = "1.0.0"
 STARTUP_TIMEOUT = 20
 CALL_TIMEOUT = 30
 CLOSE_TIMEOUT = 5
+
+IMPORT_TIMEOUT_SECONDS = 120
+IMPORT_TIMEOUT_MESSAGE = "导入失败：未能接收到文件。"
+FILE_RETENTION_SECONDS = 24 * 60 * 60
+CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
+MAX_IMPORT_BYTES = 20 * 1024 * 1024
 
 DENIED_MESSAGE = (
     "当前会话未授权使用账本指令。\n"
@@ -270,6 +285,14 @@ def _money(value: Any) -> str:
     return f"-¥{formatted}" if number < 0 else f"¥{formatted}"
 
 
+def _human_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / 1024 / 1024:.1f} MB"
+
+
 def _format_balance(payload: dict[str, Any]) -> str:
     initialized = bool(payload.get("initialized"))
     suffix = "" if initialized else "（尚未初始化）"
@@ -328,10 +351,48 @@ def _format_stats(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_import(payload: dict[str, Any]) -> str:
+    summary = payload.get("summary") or ""
+    record_count = payload.get("recordCount", 0)
+    balance = payload.get("balance")
+    lines = [f"导入完成：{summary}" if summary else "导入完成。"]
+    current = f"本机现有 {record_count} 笔账目"
+    if balance is not None:
+        current += f"，余额 {_money(balance)}"
+    lines.append(current)
+
+    try:
+        local_only = int(payload.get("localOnly", 0) or 0)
+    except (TypeError, ValueError):
+        local_only = 0
+    if local_only > 0:
+        lines.append(f"本机另有 {local_only} 笔账目不在导入文件中。")
+    return "\n".join(lines)
+
+
+def _format_export(payload: dict[str, Any], filename: str, size: int) -> str:
+    record_count = payload.get("recordCount", 0)
+    balance = payload.get("balance")
+    lines = [f"导出完成：{record_count} 笔账目"]
+    if balance is not None:
+        lines[0] += f"，余额 {_money(balance)}"
+    lines.append(f"文件：{filename}（{_human_size(size)}）")
+    return "\n".join(lines)
+
+
+def _is_ledger_file(path: Path) -> bool:
+    try:
+        with path.open("r", encoding="utf-8-sig") as file:
+            payload = json.load(file)
+    except (OSError, UnicodeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("format") == "mucage-ledger"
+
+
 @register(
     PLUGIN_NAME,
     "Mucage",
-    "通过本机 MCP 服务提供固定记账指令：/余额、/记一笔、/本月支出。",
+    "通过本机 MCP 服务提供固定记账指令，并支持导入/导出账本文件。",
     PLUGIN_VERSION,
 )
 class MucagePlugin(Star):
@@ -344,6 +405,31 @@ class MucagePlugin(Star):
         command = self.config.get("mcp_command") or "python"
         script_path = self.config.get("mcp_script_path") or ""
         self._mcp = MucageMCPClient(str(command), str(script_path))
+
+        self.data_dir = StarTools.get_data_dir(PLUGIN_NAME)
+        self.import_dir = self.data_dir / "imports"
+        self.export_dir = self.data_dir / "exports"
+        self.import_dir.mkdir(parents=True, exist_ok=True)
+        self.export_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_task: asyncio.Task[None] | None = None
+
+    async def initialize(self) -> None:
+        self._cleanup_files()
+        self._cleanup_task = asyncio.create_task(
+            self._cleanup_loop(),
+            name="mucage-file-cleanup",
+        )
+
+    async def terminate(self) -> None:
+        task = self._cleanup_task
+        self._cleanup_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+        await self._mcp.close()
 
     def _session_allowed(self, event: AstrMessageEvent) -> bool:
         sessions = self.config.get("allowed_sessions", [])
@@ -361,13 +447,79 @@ class MucagePlugin(Star):
             if str(item).strip()
         )
 
-    def _error_text(self, exc: Exception) -> str:
+    def _error_text(self, exc: Exception, prefix: str = "记账服务不可用") -> str:
         if isinstance(exc, MucageToolError):
             return str(exc)
         if isinstance(exc, MucageServiceError):
-            return f"记账服务不可用：{exc}"
+            return f"{prefix}：{exc}"
         logger.exception("调用记账 MCP 工具时出现未预期错误")
-        return f"记账服务调用失败：{exc}"
+        return f"{prefix}：{exc}"
+
+    def _new_file_path(self, directory: Path, prefix: str) -> Path:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        return directory / f"{prefix}-{stamp}-{uuid.uuid4().hex[:8]}.json"
+
+    def _cleanup_files(self) -> None:
+        cutoff = time.time() - FILE_RETENTION_SECONDS
+        for directory in (self.import_dir, self.export_dir):
+            try:
+                entries = list(directory.iterdir())
+            except OSError:
+                logger.warning("无法扫描账本文件目录：%s", directory)
+                continue
+            for path in entries:
+                try:
+                    if path.is_file() and path.stat().st_mtime < cutoff:
+                        path.unlink()
+                        logger.debug("已清理过期账本文件：%s", path)
+                except OSError:
+                    logger.warning("清理账本文件失败：%s", path)
+
+    async def _cleanup_loop(self) -> None:
+        while True:
+            await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+            self._cleanup_files()
+
+    async def _import_file(self, file_component: File) -> str:
+        self._cleanup_files()
+
+        try:
+            source = await file_component.get_file()
+        except Exception as exc:
+            raise MucageServiceError(f"无法下载文件：{exc}") from exc
+        if not source:
+            raise MucageServiceError("未能读取文件内容。")
+
+        source_path = Path(source)
+        try:
+            size = source_path.stat().st_size
+        except OSError as exc:
+            raise MucageServiceError(f"无法读取文件：{exc}") from exc
+        if size <= 0:
+            raise MucageServiceError("文件为空。")
+        if size > MAX_IMPORT_BYTES:
+            raise MucageServiceError(
+                f"文件过大，最大支持 {_human_size(MAX_IMPORT_BYTES)}。"
+            )
+        if not _is_ledger_file(source_path):
+            raise MucageServiceError("文件不是有效的账本同步文件。")
+
+        target = self._new_file_path(self.import_dir, "import")
+        try:
+            shutil.copyfile(source_path, target)
+        except OSError as exc:
+            raise MucageServiceError(f"保存导入文件失败：{exc}") from exc
+
+        payload = await self._mcp.call_json("import_ledger", {"path": str(target)})
+        return _format_import(payload)
+
+    async def _export_file(self) -> tuple[str, Path]:
+        self._cleanup_files()
+        target = self._new_file_path(self.export_dir, "export")
+        payload = await self._mcp.call_json("export_ledger", {"path": str(target)})
+        if not target.is_file():
+            raise MucageServiceError("导出完成但未找到导出文件。")
+        return _format_export(payload, target.name, target.stat().st_size), target
 
     @filter.command("余额")
     async def balance(self, event: AstrMessageEvent):
@@ -446,6 +598,87 @@ class MucagePlugin(Star):
         event.stop_event()
         yield event.plain_result(_format_stats(payload))
 
+    @filter.command("导入")
+    async def import_ledger(self, event: AstrMessageEvent):
+        """导入账本同步文件；等待文件最长 2 分钟"""
+        if not self._session_allowed(event):
+            event.stop_event()
+            yield event.plain_result(DENIED_MESSAGE)
+            return
+
+        event.stop_event()
+        await event.send(
+            event.plain_result("请在 2 分钟内发送账本同步文件（mucage-ledger JSON）。")
+        )
+
+        @session_waiter(timeout=IMPORT_TIMEOUT_SECONDS, record_history_chains=False)
+        async def wait_for_file(
+            controller: SessionController,
+            file_event: AstrMessageEvent,
+        ) -> None:
+            file_component = next(
+                (
+                    component
+                    for component in file_event.get_messages()
+                    if isinstance(component, File)
+                ),
+                None,
+            )
+            if file_component is None:
+                return
+
+            # 文件已收到，立即停止计时，后续只执行一次导入。
+            controller.stop()
+            try:
+                reply = await self._import_file(file_component)
+            except MucageToolError as exc:
+                await file_event.send(file_event.plain_result(str(exc)))
+            except Exception as exc:
+                await file_event.send(
+                    file_event.plain_result(self._error_text(exc, "导入失败"))
+                )
+            else:
+                await file_event.send(file_event.plain_result(reply))
+
+        try:
+            await wait_for_file(event)
+        except TimeoutError:
+            await event.send(event.plain_result(IMPORT_TIMEOUT_MESSAGE))
+        except Exception as exc:
+            logger.exception("等待导入文件失败")
+            await event.send(
+                event.plain_result(self._error_text(exc, "导入失败"))
+            )
+
+    @filter.command("导出")
+    async def export_ledger(self, event: AstrMessageEvent) -> None:
+        """导出完整账本并发送同步文件"""
+        if not self._session_allowed(event):
+            event.stop_event()
+            await event.send(event.plain_result(DENIED_MESSAGE))
+            return
+
+        try:
+            reply, path = await self._export_file()
+        except Exception as exc:
+            event.stop_event()
+            await event.send(
+                event.plain_result(self._error_text(exc, "导出失败"))
+            )
+            return
+
+        event.stop_event()
+        await event.send(event.plain_result(reply))
+        try:
+            await event.send(
+                event.chain_result([File(name=path.name, file=str(path))])
+            )
+        except Exception as exc:
+            logger.exception("发送导出文件失败")
+            await event.send(
+                event.plain_result(f"导出文件发送失败：{exc}")
+            )
+
     @staticmethod
     def _command_args(event: AstrMessageEvent, command: str) -> str:
         text = (event.message_str or "").strip()
@@ -453,7 +686,3 @@ class MucagePlugin(Star):
         if index < 0:
             return ""
         return text[index + len(command) :].strip()
-
-    async def terminate(self):
-        """插件卸载或重载时关闭 MCP 子进程。"""
-        await self._mcp.close()

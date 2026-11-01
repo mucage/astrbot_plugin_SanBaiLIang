@@ -3,8 +3,8 @@
 为 AstrBot 提供固定指令，读写本机「此地无银三百两」账本。
 
 插件不直接读写 `ledger.json`，也不重复实现余额、分类合并等逻辑，而是通过 Python MCP 客户端 SDK
-以 stdio 启动账本软件自带的 `mucage_mcp.py`，复用其 11 个 MCP 工具中的 `get_balance`、
-`add_record`、`get_stats`。
+以 stdio 启动账本软件自带的 `mucage_mcp.py`，复用其 MCP 工具。除查询和记账外，还支持通过聊天
+文件导入、导出完整账本。
 
 > AstrBot 已原生支持 MCP，本插件不是接入账本的必需项，只用于提供确定性的固定指令。
 
@@ -15,6 +15,8 @@
 | `/余额` | 查询当前总余额与账目数量 | `get_balance` |
 | `/记一笔 金额 [分类] [备注]` | 记一笔支出，备注可包含空格 | `add_record` |
 | `/本月支出` | 查询本月支出合计与分类占比 | `get_stats` |
+| `/导入` | 等待并导入账本同步文件，最长等待 2 分钟 | `import_ledger` |
+| `/导出` | 导出完整账本，并把 JSON 文件发送到当前会话 | `export_ledger` |
 
 示例：
 
@@ -24,10 +26,40 @@
 
 分类省略时由账本归入「其他」。工具返回错误时，插件原样显示错误文本。
 
+### 导入
+
+发送 `/导入` 后，机器人会提示发送账本同步文件，并等待最多 2 分钟：
+
+- 在收到文件前不会执行导入操作；普通文字消息会被忽略。
+- 收到文件后立即停止计时，校验并保存文件，然后调用 `import_ledger` 合并。
+- 2 分钟内没有收到文件时，返回：`导入失败：未能接收到文件。`
+- 只接受账本软件导出的 `mucage-ledger` JSON 文件，最大 20 MB。
+- 合并规则由账本服务负责：按 `syncId` 去重，`updatedAt` 较新者胜出，源文件不会被修改。
+
+### 导出
+
+`/导出` 调用 `export_ledger` 生成完整账本 JSON，并作为文件发送到当前会话。文件只包含账本同步
+数据，不包含本插件配置、日志或本机路径。
+
+### 文件存储与清理
+
+导入、导出的文件按时间戳和随机后缀规范存放：
+
+```text
+data/plugin_data/astrbot_plugin_SanBaiLIang/
+  imports/import-YYYYMMDD-HHMMSS-xxxxxxxx.json
+  exports/export-YYYYMMDD-HHMMSS-xxxxxxxx.json
+```
+
+插件启动时清理一次，运行期间每 6 小时清理一次，删除超过 24 小时的文件。导出文件包含完整账本，
+请在清理前妥善保管，避免把 `plugin_data` 目录或其中文件分享给他人。
+
 ## 前置条件
 
 - AstrBot `>= 4.16,<5`。
-- 本机已安装「此地无银三百两」账本软件，且存在 MCP 启动包装器 `mucage_mcp.py`。
+- Windows 桌面端「此地无银三百两」账本软件 **10.27.2 或更高版本**（提供 `import_ledger` /
+  `export_ledger` 工具）。
+- 存在 MCP 启动包装器 `mucage_mcp.py`。
 - `MucageLedger.exe` 与 `mucage_mcp.py` 在同一目录；如果不在同一目录，请在启动 AstrBot 前设置
   环境变量 `MUCAGE_LEDGER_EXE` 指向 `MucageLedger.exe`。
 - AstrBot 运行环境中的 Python 可以运行该包装器。插件依赖 `mcp` SDK，见 `requirements.txt`。
@@ -75,7 +107,8 @@
 - 在 WebUI 配置页点击「允许使用指令的会话」，选择目标会话；或
 - 在目标会话发送 `/sid`，把返回的 `UMO` 加入 `allowed_sessions`。
 
-白名单按完整 UMO 精确匹配，不支持通配符；同一会话内的所有成员都视为已授权。
+白名单按完整 UMO 精确匹配，不支持通配符；同一会话内的所有成员都视为已授权。`/导入` 的等待状态
+也绑定到发起指令的会话。
 
 ## 重要：不要同时启用 AstrBot 的 MCP 服务器
 
@@ -98,7 +131,8 @@ Get-CimInstance Win32_Process |
 2. 在 WebUI 启用插件。
 3. 在允许的会话中发送 `/余额` 验证连接。
 
-首次调用时才启动 MCP 子进程；之后复用同一个会话。插件被停用、卸载或重载时会关闭该子进程。
+首次调用时才启动 MCP 子进程；之后复用同一个会话。插件被停用、卸载或重载时会关闭该子进程，
+并停止文件清理任务。
 
 ## 测试（使用临时账本，不要动真实账本）
 
@@ -128,17 +162,27 @@ New-Item -ItemType Directory -Force $env:MUCAGE_LEDGER_HOME | Out-Null
    - 预期余额比上一步减少 `12.50`。若初始为 0，则显示 `当前余额：-¥12.50`、`账目：1 笔`。
 4. `/本月支出`
    - 预期显示本月支出 `¥12.50（1 笔）`，以及分类 `吃` 的占比。
+5. `/导出`
+   - 预期收到一段导出摘要和一个 `export-*.json` 文件。
+6. `/导入`
+   - 不发送文件，等待 2 分钟，预期返回 `导入失败：未能接收到文件。`。
+   - 再次发送 `/导入`，随后发送刚导出的 JSON 文件，预期返回合并摘要与当前余额。
 
 验证隔离生效：
 
 - `%TEMP%\mucage-plugin-test` 下应生成账本文件；
-- `%APPDATA%\MucageLedger\ledger.json` 的修改时间不应变化。
+- `%APPDATA%\MucageLedger\ledger.json` 的修改时间不应变化；
+- 导入导出文件位于 `%USERPROFILE%\.astrbot\data\plugin_data\astrbot_plugin_SanBaiLIang`。
 
 测试结束后，移除 `MUCAGE_LEDGER_HOME` 环境变量并重启 AstrBot，即可恢复真实账本。
 
 ## 已知限制
 
 - 仅提供支出记账，暂不支持收入、指定日期、分类管理等指令。
+- `/导入` 只接受平台提供的**文件消息段**；把链接、图片或普通文本发过来不会被当作账本文件。
+- `/导出` 发送文件依赖平台适配器支持 `File` 消息段；不支持时只发送摘要和错误提示。
+- 单次导入文件最大 20 MB；导入、导出文件保留 24 小时，每 6 小时清理一次。
+- `/导入` 等待期间，该会话的后续消息会优先交给等待逻辑接管；非文件消息不会触发正常回复，也不会执行导入。
 - 白名单按完整 UMO 精确匹配，不支持通配符；修改配置后建议重载插件。
 - 每个插件实例只维护一个 MCP 子进程，所有指令串行执行。
 - MCP 启动最长等待 20 秒，单次工具调用最长等待 30 秒；超时会关闭连接，下次调用重新启动。
@@ -147,6 +191,7 @@ New-Item -ItemType Directory -Force $env:MUCAGE_LEDGER_HOME | Out-Null
 - 插件只提供固定指令，不注册 LLM 工具，不会让模型自行记账。
 - 群聊白名单授权的是整个会话，无法区分会话内具体成员。
 - 账本余额与合并逻辑由账本软件的 MCP 服务负责，插件只展示其返回值。
+- 导入、导出文件包含完整账本数据，请勿将 `plugin_data` 目录或导出文件随意分享。
 
 ## 故障排查
 
@@ -157,16 +202,30 @@ New-Item -ItemType Directory -Force $env:MUCAGE_LEDGER_HOME | Out-Null
 | `No module named mcp` | 在 AstrBot 运行环境中安装 `requirements.txt` |
 | `记账服务不可用：...` | 检查 `mcp_command` 和脚本路径；可在终端手动运行 `python mucage_mcp.py` 验证 |
 | 工具返回 `金额必须大于 0` | 这是账本工具的原样错误提示，修正金额后重试 |
+| `导入失败：文件不是有效的账本同步文件。` | 确认发送的是账本软件导出的 `mucage-ledger` JSON |
+| `导入失败：未能接收到文件。` | 在 2 分钟内发送账本文件；确认平台把文件作为文件消息段传递 |
+| 导出后没有收到文件 | 当前平台可能不支持 `File` 消息段，查看文字错误提示 |
 | 指令无响应且提示未授权 | 将当前会话 UMO 加入 `allowed_sessions` |
 
 ## 卸载
 
-1. 在 WebUI 停用插件（会触发 `terminate` 并关闭 MCP 子进程）。
+1. 在 WebUI 停用插件（会触发 `terminate`，关闭 MCP 子进程并停止清理任务）。
 2. 删除插件目录。
-3. 如需彻底清理，删除插件配置 `data/config/astrbot_plugin_SanBaiLIang_config.json`。
+3. 如需彻底清理，删除：
+   - 配置 `data/config/astrbot_plugin_SanBaiLIang_config.json`
+   - 导入导出文件 `data/plugin_data/astrbot_plugin_SanBaiLIang/`
+
+## 许可证
+
+本项目以 **GNU Affero General Public License v3.0 only（AGPL-3.0-only）** 开源，完整条款见
+[LICENSE](LICENSE)。
+
+Copyright (C) 2026 Mucage。
+
+如果修改本项目并通过网络提供服务，请按 AGPL-3.0 的要求向用户提供对应源码。
 
 ## 参考
 
 - [AstrBot 插件开发指南](https://docs.astrbot.app/dev/star/plugin-new.html)
 - [AstrBot MCP 使用文档](https://docs.astrbot.app/use/mcp.html)
-- 插件按官方 `Star` / `register` / `filter` 与 `_conf_schema.json` 配置机制实现。
+- 插件按官方 `Star` / `register` / `filter`、`session_waiter` 与 `_conf_schema.json` 配置机制实现。
