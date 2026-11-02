@@ -26,7 +26,7 @@ from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.api.util import SessionController, session_waiter
 
 PLUGIN_NAME = "astrbot_plugin_SanBaiLIang"
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.0"
 
 STARTUP_TIMEOUT = 20
 CALL_TIMEOUT = 30
