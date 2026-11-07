@@ -26,7 +26,7 @@ from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.api.util import SessionController, session_waiter
 
 PLUGIN_NAME = "astrbot_plugin_SanBaiLIang"
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.2.0"
 
 STARTUP_TIMEOUT = 20
 CALL_TIMEOUT = 30
@@ -41,6 +41,10 @@ MAX_IMPORT_BYTES = 20 * 1024 * 1024
 DENIED_MESSAGE = (
     "当前会话未授权使用账本指令。\n"
     "请在 AstrBot 插件配置的「允许使用指令的会话」中添加本会话。"
+)
+
+AUTO_SAVE_USAGE = (
+    "用法：/自动攒着 [关闭 | 每周|每月|每年 金额 [计入|不计入]]"
 )
 
 
@@ -293,11 +297,67 @@ def _human_size(size: int) -> str:
     return f"{size / 1024 / 1024:.1f} MB"
 
 
+def _auto_save_line(auto: Any) -> str:
+    if not isinstance(auto, dict) or not auto.get("enabled"):
+        return ""
+    period = auto.get("periodLabel") or auto.get("period") or ""
+    count_text = "计入支出" if auto.get("countAsExpense") else "不计入支出"
+    line = f"自动攒着：{period} {_money(auto.get('amount', 0))}（{count_text}）"
+    next_at = auto.get("nextAt")
+    if next_at:
+        line += f"，下次 {next_at}"
+    return line
+
+
 def _format_balance(payload: dict[str, Any]) -> str:
     initialized = bool(payload.get("initialized"))
     suffix = "" if initialized else "（尚未初始化）"
-    count = payload.get("recordCount", 0)
-    return f"当前余额：{_money(payload.get('balance', 0))}{suffix}\n账目：{count} 笔"
+    total = payload.get("total", payload.get("balance", 0))
+    lines = [f"总余额：{_money(total)}{suffix}"]
+    if "saved" in payload or "available" in payload:
+        lines.append(f"攒着：{_money(payload.get('saved', 0))}")
+        lines.append(f"可用：{_money(payload.get('available', total))}")
+    lines.append(f"账目：{payload.get('recordCount', 0)} 笔")
+
+    auto_line = _auto_save_line(payload.get("autoSave"))
+    if auto_line:
+        lines.append(auto_line)
+    return "\n".join(lines)
+
+
+def _format_savings_change(payload: dict[str, Any], kind: str) -> str:
+    value_key = "saved" if kind == "攒着" else "available"
+    other_key = "available" if kind == "攒着" else "saved"
+    other_label = "可用" if kind == "攒着" else "攒着"
+    total = payload.get("total", payload.get("balance", 0))
+    line = f"总余额：{_money(total)}"
+    if other_key in payload:
+        line += f"，{other_label}：{_money(payload[other_key])}"
+    return f"{kind}已调整为：{_money(payload.get(value_key, 0))}\n{line}"
+
+
+def _format_auto_query(auto: Any) -> str:
+    if not isinstance(auto, dict) or not auto.get("enabled"):
+        return "自动攒着：未开启"
+    period = auto.get("periodLabel") or auto.get("period") or ""
+    count_text = "计入支出" if auto.get("countAsExpense") else "不计入支出"
+    lines = [f"自动攒着：{period} {_money(auto.get('amount', 0))}（{count_text}）"]
+    if auto.get("lastAt"):
+        lines.append(f"上次转入：{auto['lastAt']}")
+    if auto.get("nextAt"):
+        lines.append(f"下次转入：{auto['nextAt']}")
+    return "\n".join(lines)
+
+
+def _format_auto_change(payload: dict[str, Any]) -> str:
+    if not payload.get("enabled"):
+        return "自动攒着已关闭"
+    period = payload.get("periodLabel") or payload.get("period") or ""
+    count_text = "计入支出" if payload.get("countAsExpense") else "不计入支出"
+    lines = [f"自动攒着已更新：{period} {_money(payload.get('amount', 0))}（{count_text}）"]
+    if payload.get("nextAt"):
+        lines.append(f"下次转入：{payload['nextAt']}")
+    return "\n".join(lines)
 
 
 def _format_record(payload: dict[str, Any]) -> str:
@@ -309,7 +369,7 @@ def _format_record(payload: dict[str, Any]) -> str:
         detail += f" · {note}"
     lines = [detail]
     if "balance" in payload:
-        lines.append(f"当前余额：{_money(payload['balance'])}")
+        lines.append(f"当前总余额：{_money(payload['balance'])}")
     return "\n".join(lines)
 
 
@@ -358,7 +418,7 @@ def _format_import(payload: dict[str, Any]) -> str:
     lines = [f"导入完成：{summary}" if summary else "导入完成。"]
     current = f"本机现有 {record_count} 笔账目"
     if balance is not None:
-        current += f"，余额 {_money(balance)}"
+        current += f"，总余额 {_money(balance)}"
     lines.append(current)
 
     try:
@@ -375,7 +435,7 @@ def _format_export(payload: dict[str, Any], filename: str, size: int) -> str:
     balance = payload.get("balance")
     lines = [f"导出完成：{record_count} 笔账目"]
     if balance is not None:
-        lines[0] += f"，余额 {_money(balance)}"
+        lines[0] += f"，总余额 {_money(balance)}"
     lines.append(f"文件：{filename}（{_human_size(size)}）")
     return "\n".join(lines)
 
@@ -392,7 +452,7 @@ def _is_ledger_file(path: Path) -> bool:
 @register(
     PLUGIN_NAME,
     "Mucage",
-    "通过本机 MCP 服务提供固定记账指令，并支持导入/导出账本文件。",
+    "通过本机 MCP 服务提供固定记账指令，支持余额拆分、自动攒着和导入/导出。",
     PLUGIN_VERSION,
 )
 class MucagePlugin(Star):
@@ -598,6 +658,142 @@ class MucagePlugin(Star):
         event.stop_event()
         yield event.plain_result(_format_stats(payload))
 
+    @filter.command("攒着")
+    async def savings(self, event: AstrMessageEvent):
+        """调整攒着金额：/攒着 金额"""
+        if not self._session_allowed(event):
+            event.stop_event()
+            yield event.plain_result(DENIED_MESSAGE)
+            return
+
+        amount = self._amount_arg(self._command_args(event, "攒着"))
+        if amount is None:
+            event.stop_event()
+            yield event.plain_result("用法：/攒着 金额（金额不能为负）")
+            return
+
+        try:
+            payload = await self._mcp.call_json("set_savings", {"amount": amount})
+        except Exception as exc:
+            event.stop_event()
+            yield event.plain_result(self._error_text(exc, "攒着失败"))
+            return
+
+        event.stop_event()
+        yield event.plain_result(_format_savings_change(payload, "攒着"))
+
+    @filter.command("可用")
+    async def available(self, event: AstrMessageEvent):
+        """调整可用金额：/可用 金额"""
+        if not self._session_allowed(event):
+            event.stop_event()
+            yield event.plain_result(DENIED_MESSAGE)
+            return
+
+        amount = self._amount_arg(self._command_args(event, "可用"))
+        if amount is None:
+            event.stop_event()
+            yield event.plain_result("用法：/可用 金额（金额不能为负）")
+            return
+
+        try:
+            payload = await self._mcp.call_json("set_available", {"amount": amount})
+        except Exception as exc:
+            event.stop_event()
+            yield event.plain_result(self._error_text(exc, "可用失败"))
+            return
+
+        event.stop_event()
+        yield event.plain_result(_format_savings_change(payload, "可用"))
+
+    @filter.command("自动攒着")
+    async def auto_savings(self, event: AstrMessageEvent):
+        """查看或配置自动攒着"""
+        if not self._session_allowed(event):
+            event.stop_event()
+            yield event.plain_result(DENIED_MESSAGE)
+            return
+
+        args = self._command_args(event, "自动攒着")
+        if not args:
+            try:
+                payload = await self._mcp.call_json("get_balance", {})
+            except Exception as exc:
+                event.stop_event()
+                yield event.plain_result(self._error_text(exc))
+                return
+
+            event.stop_event()
+            yield event.plain_result(_format_auto_query(payload.get("autoSave")))
+            return
+
+        parts = args.split()
+        action = parts[0].lower()
+        if action in {"关闭", "关", "off", "停用"}:
+            if len(parts) != 1:
+                event.stop_event()
+                yield event.plain_result(AUTO_SAVE_USAGE)
+                return
+            arguments = {"enabled": False}
+        else:
+            if action in {"开启", "开", "on", "启用"}:
+                parts = parts[1:]
+            if len(parts) < 2:
+                event.stop_event()
+                yield event.plain_result(AUTO_SAVE_USAGE)
+                return
+
+            periods = {
+                "每周": "每周",
+                "weekly": "每周",
+                "每月": "每月",
+                "monthly": "每月",
+                "每年": "每年",
+                "yearly": "每年",
+            }
+            period = periods.get(parts[0].lower())
+            amount = self._amount_arg(parts[1], require_positive=True)
+            if period is None:
+                event.stop_event()
+                yield event.plain_result(AUTO_SAVE_USAGE)
+                return
+            if amount is None:
+                event.stop_event()
+                yield event.plain_result(
+                    "金额不正确，示例：/自动攒着 每月 200 计入"
+                )
+                return
+
+            arguments = {
+                "enabled": True,
+                "period": period,
+                "amount": amount,
+            }
+            if len(parts) >= 3:
+                if len(parts) > 3:
+                    event.stop_event()
+                    yield event.plain_result(AUTO_SAVE_USAGE)
+                    return
+                flag = parts[2].lower()
+                if flag in {"计入", "计入支出", "是", "true", "1", "yes"}:
+                    arguments["countAsExpense"] = True
+                elif flag in {"不计入", "不计入支出", "否", "false", "0", "no"}:
+                    arguments["countAsExpense"] = False
+                else:
+                    event.stop_event()
+                    yield event.plain_result(AUTO_SAVE_USAGE)
+                    return
+
+        try:
+            payload = await self._mcp.call_json("set_savings_auto", arguments)
+        except Exception as exc:
+            event.stop_event()
+            yield event.plain_result(self._error_text(exc, "自动攒着失败"))
+            return
+
+        event.stop_event()
+        yield event.plain_result(_format_auto_change(payload))
+
     @filter.command("导入")
     async def import_ledger(self, event: AstrMessageEvent):
         """导入账本同步文件；等待文件最长 2 分钟"""
@@ -678,6 +874,18 @@ class MucagePlugin(Star):
             await event.send(
                 event.plain_result(f"导出文件发送失败：{exc}")
             )
+
+    @staticmethod
+    def _amount_arg(text: str, require_positive: bool = False) -> float | None:
+        try:
+            amount = float(text)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(amount) or amount < 0:
+            return None
+        if require_positive and amount <= 0:
+            return None
+        return amount
 
     @staticmethod
     def _command_args(event: AstrMessageEvent, command: str) -> str:

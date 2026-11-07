@@ -1,7 +1,7 @@
 name: astrbot_plugin_SanBaiLIang
 display_name: 此地无银三百两账本
-desc: 通过本机 MCP stdio 服务提供固定记账指令：/余额、/记一笔、/本月支出、/导入、/导出；不直接读写 ledger.json。
-short_desc: 用固定指令读写本机「此地无银三百两」账本，并支持导入/导出完整账本文件。
-version: 1.1.0
+desc: 通过本机 MCP stdio 服务提供固定记账指令：/余额、/记一笔、/本月支出、/攒着、/可用、/自动攒着、/导入、/导出；不直接读写 ledger.json。
+short_desc: 用固定指令读写本机「此地无银三百两」账本，支持余额拆分、自动攒着和导入/导出。
+version: 1.2.0
 author: Mucage
 astrbot_version: ">=4.16,<5"
